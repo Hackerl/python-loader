@@ -1,10 +1,10 @@
-#include "asm/inline_hook.h"
 #include <unistd.h>
 #include <zero/log.h>
 #include <zero/proc/process.h>
 #include <elfio/elfio.hpp>
 #include <sys/user.h>
 #include <elf.h>
+#include <trap/trap.h>
 
 using EvalFramePtr = void *(*)(void *, void *, void *);
 using EvalStringPtr = int (*)(const char *);
@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
         return -1;
     }
 
-    unsigned long baseAddress = 0;
+    unsigned long base = 0;
 
     if (reader.get_type() != ET_EXEC) {
         std::vector<ELFIO::segment *> loads;
@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
                     return i->get_virtual_address() < j->get_virtual_address();
                 });
 
-        baseAddress = processMapping.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
+        base = processMapping.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
     }
 
     ELFIO::symbol_section_accessor symbols(reader, *it);
@@ -117,7 +117,7 @@ int main(int argc, char ** argv) {
         return -1;
     }
 
-    eval = (EvalStringPtr)(baseAddress + value);
+    eval = (EvalStringPtr)(base + value);
 
     if (!symbols.get_symbol(EVAL_FRAME_DEFAULT_SYMBOL, value, size, bind, type, section, other) &&
         !symbols.get_symbol(EVAL_FRAME_SYMBOL, value, size, bind, type, section, other)) {
@@ -125,8 +125,10 @@ int main(int argc, char ** argv) {
         return -1;
     }
 
-    if (!gInlineHook->hook((void *)(baseAddress + value), (void *)entry, (void **)&origin)) {
-        LOG_WARNING("hook eval frame failed");
+    LOG_INFO("eval frame address: 0x%lx", base + value);
+
+    if (hook((void *)(base + value), (void *)entry, (void **)&origin) < 0) {
+        LOG_ERROR("hook eval frame failed");
         return -1;
     }
 

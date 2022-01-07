@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.17)
 project(python_loader)
 
 set(CMAKE_CXX_STANDARD 14)
@@ -24,20 +24,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ELFIO)
 
 FetchContent_Declare(
-        zydis
-        GIT_REPOSITORY https://github.com/zyantific/zydis
-        GIT_TAG v3.1.0
-)
-
-FetchContent_MakeAvailable(zydis)
-
-FetchContent_Declare(
-        zero
-        GIT_REPOSITORY https://github.com/Hackerl/zero
+        trap
+        GIT_REPOSITORY https://github.com/Hackerl/trap
         GIT_TAG master
 )
 
-FetchContent_MakeAvailable(zero)
+FetchContent_MakeAvailable(trap)
 
 FetchContent_Declare(
         c-runtime
@@ -47,5 +39,5 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(c-runtime)
 
-add_executable(python_loader main.cpp asm/inline_hook.cpp heap/memory.cpp)
-target_link_libraries(python_loader zero c_runtime elfio Zydis $<$<BOOL:${STATIC_BUILD}>:-static-pie>)
+add_executable(python_loader main.cpp heap/memory.cpp)
+target_link_libraries(python_loader trap c_runtime elfio $<$<BOOL:${STATIC_BUILD}>:-static-pie>)
