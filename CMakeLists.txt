@@ -13,6 +13,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "disable disassembler tools")
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "disable disassembler examples")
 
+set(C_RUNTIME_HEAP_CACHE OFF CACHE BOOL "disable heap memory cache")
+
 include(FetchContent)
 
 FetchContent_Declare(
