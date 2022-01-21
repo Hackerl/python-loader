@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <zero/log.h>
+#include <zero/cmdline.h>
 #include <zero/proc/process.h>
 #include <elfio/elfio.hpp>
 #include <sys/user.h>
@@ -21,11 +22,11 @@ static EvalFramePtr origin = nullptr;
 static EvalStringPtr eval = nullptr;
 
 static int guard = 0;
-static char script[10240] = {};
+static char code[10240] = {};
 
 void *entry(void *x, void *y, void *z) {
     if (!guard && __sync_bool_compare_and_swap(&guard, 0, 1))
-        eval(script);
+        eval(code);
 
     return origin(x, y, z);
 }
@@ -33,17 +34,33 @@ void *entry(void *x, void *y, void *z) {
 int main(int argc, char ** argv) {
     INIT_CONSOLE_LOG(zero::INFO);
 
-    if (argc < 2) {
-        LOG_ERROR("require script");
-        return -1;
+    zero::CCmdline cmdline;
+
+    cmdline.add({"script", "python script", zero::value<std::string>()});
+    cmdline.addOptional({"file", 'f', "load script from file", zero::value<bool>(), true});
+
+    cmdline.parse(argc, argv);
+
+    bool file = cmdline.getOptional<bool>("file");
+    std::string script = cmdline.get<std::string>("script");
+
+    if (file) {
+        std::ifstream stream(script);
+
+        if (!stream.is_open()) {
+            LOG_ERROR("script does not exist");
+            return -1;
+        }
+
+        script = {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
     }
 
-    if (strlen(argv[1]) >= sizeof(script)) {
+    if (script.length() >= sizeof(code)) {
         LOG_ERROR("script length limit");
         return -1;
     }
 
-    strcpy(script, argv[1]);
+    strcpy(code, script.data());
 
     pid_t pid = getpid();
     zero::proc::CProcessMapping processMapping;
