@@ -32,7 +32,7 @@ void *entry(void *x, void *y, void *z) {
 }
 
 int main(int argc, char ** argv) {
-    INIT_CONSOLE_LOG(zero::INFO);
+    INIT_CONSOLE_LOG(zero::ERROR);
 
     zero::CCmdline cmdline;
 
