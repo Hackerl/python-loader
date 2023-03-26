@@ -1,50 +1,52 @@
 #include <unistd.h>
 #include <zero/log.h>
 #include <zero/cmdline.h>
-#include <zero/proc/process.h>
-#include <elfio/elfio.hpp>
+#include <zero/os/procfs.h>
 #include <sys/user.h>
-#include <elf.h>
+#include <elf/symbol.h>
 #include <trap/trap.h>
 
-using EvalFramePtr = void *(*)(void *, void *, void *);
-using EvalStringPtr = int (*)(const char *);
+using EvalFrame = void *(*)(void *, void *, void *);
+using EvalString = int (*)(const char *);
 
-constexpr auto UWSGI_IMAGE = "uwsgi";
-constexpr auto PYTHON_IMAGE = "bin/python";
-constexpr auto PYTHON_LIBRARY_IMAGE = "libpython";
+constexpr auto PYTHON_IMAGE = {
+        "libpython",
+        "bin/python",
+        "uwsgi"
+};
 
 constexpr auto EVAL_STRING_SYMBOL = "PyRun_SimpleString";
 constexpr auto EVAL_FRAME_SYMBOL = "PyEval_EvalFrameEx";
 constexpr auto EVAL_FRAME_DEFAULT_SYMBOL = "_PyEval_EvalFrameDefault";
 
-static EvalFramePtr origin = nullptr;
-static EvalStringPtr eval = nullptr;
+static EvalFrame origin = nullptr;
+static EvalString eval = nullptr;
 
-static int guard = 0;
 static char code[10240] = {};
+static std::atomic<bool> done = false;
 
-void *entry(void *x, void *y, void *z) {
-    if (!guard && __sync_bool_compare_and_swap(&guard, 0, 1))
+void *fake(void *x, void *y, void *z) {
+    bool expected = false;
+
+    if (!done && done.compare_exchange_strong(expected, true))
         eval(code);
 
     return origin(x, y, z);
 }
 
-int main(int argc, char ** argv) {
-    INIT_CONSOLE_LOG(zero::ERROR);
+int main(int argc, char **argv) {
+    INIT_CONSOLE_LOG(zero::INFO_LEVEL);
 
-    zero::CCmdline cmdline;
+    zero::Cmdline cmdline;
 
-    cmdline.add({"script", "python script", zero::value<std::string>()});
-    cmdline.addOptional({"file", 'f', "load script from file", zero::value<bool>(), true});
+    cmdline.add<std::string>("script", "python script");
+    cmdline.addOptional("file", 'f', "load script from file");
 
     cmdline.parse(argc, argv);
 
-    bool file = cmdline.getOptional<bool>("file");
-    std::string script = cmdline.get<std::string>("script");
+    auto script = cmdline.get<std::string>("script");
 
-    if (file) {
+    if (cmdline.exist("file")) {
         std::ifstream stream(script);
 
         if (!stream.is_open()) {
@@ -56,96 +58,109 @@ int main(int argc, char ** argv) {
     }
 
     if (script.length() >= sizeof(code)) {
-        LOG_ERROR("script length limit");
+        LOG_ERROR("script too long");
         return -1;
     }
 
-    strcpy(code, script.data());
+    strcpy(code, script.c_str());
 
-    pid_t pid = getpid();
-    zero::proc::CProcessMapping processMapping;
+    std::optional<zero::os::procfs::Process> process = zero::os::procfs::openProcess(getpid());
 
-    if (
-            !zero::proc::getImageBase(pid, PYTHON_LIBRARY_IMAGE, processMapping) &&
-            !zero::proc::getImageBase(pid, PYTHON_IMAGE, processMapping) &&
-            !zero::proc::getImageBase(pid, UWSGI_IMAGE, processMapping)
-            ) {
-        LOG_ERROR("can't find python image base");
+    if (!process)
+        return -1;
+
+    auto it = std::find_if(PYTHON_IMAGE.begin(), PYTHON_IMAGE.end(), [&](const auto &image) {
+        return process->getImageBase(image);
+    });
+
+    if (it == PYTHON_IMAGE.end()) {
+        LOG_ERROR("can't find python image");
         return -1;
     }
 
-    LOG_INFO("python image base: 0x%lx", processMapping.start);
+    std::optional<zero::os::procfs::MemoryMapping> memoryMapping = process->getImageBase(*it);
 
-    std::string path = zero::filesystem::path::join("/proc/self/root", processMapping.pathname);
-
-    ELFIO::elfio reader;
-
-    if (!reader.load(path)) {
-        LOG_ERROR("open elf failed: %s", path.c_str());
+    if (!memoryMapping) {
+        LOG_ERROR("can't get python image");
         return -1;
     }
 
-    auto it = std::find_if(
-            reader.sections.begin(),
-            reader.sections.end(),
-            [](const auto& s) {
-                return s->get_type() == SHT_DYNSYM;
-            });
+    LOG_INFO("python image base: 0x%lx", memoryMapping->start);
 
-    if (it == reader.sections.end()) {
+    std::filesystem::path path = std::filesystem::path("/proc/self/root") / memoryMapping->pathname;
+    std::optional<elf::Reader> reader = elf::openFile(path);
+
+    if (!reader) {
+        LOG_ERROR("open elf failed: %s", path.string().c_str());
+        return -1;
+    }
+
+    std::vector<std::shared_ptr<elf::ISection>> sections = reader->sections();
+
+    auto sit = std::find_if(
+            sections.begin(),
+            sections.end(),
+            [](const auto &section) {
+                return section->type() == SHT_DYNSYM;
+            }
+    );
+
+    if (sit == sections.end()) {
         LOG_ERROR("can't find symbol section");
         return -1;
     }
 
-    unsigned long base = 0;
+    bool dynamic = reader->header()->type() == ET_DYN;
 
-    if (reader.get_type() != ET_EXEC) {
-        std::vector<ELFIO::segment *> loads;
+    std::vector<std::shared_ptr<elf::ISegment>> loads;
+    std::vector<std::shared_ptr<elf::ISegment>> segments = reader->segments();
 
-        std::copy_if(
-                reader.segments.begin(),
-                reader.segments.end(),
-                std::back_inserter(loads),
-                [](const auto &i){
-                    return i->get_type() == PT_LOAD;
-                });
+    std::copy_if(
+            segments.begin(),
+            segments.end(),
+            std::back_inserter(loads),
+            [](const auto &segment) {
+                return segment->type() == PT_LOAD;
+            }
+    );
 
-        auto minElement = std::min_element(
-                loads.begin(),
-                loads.end(),
-                [](const auto &i, const auto &j) {
-                    return i->get_virtual_address() < j->get_virtual_address();
-                });
+    Elf64_Addr minVA = std::min_element(
+            loads.begin(),
+            loads.end(),
+            [](const auto &i, const auto &j) {
+                return i->virtualAddress() < j->virtualAddress();
+            }
+    )->operator*().virtualAddress() & ~(PAGE_SIZE - 1);
 
-        base = processMapping.start - ((*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1));
-    }
+    elf::SymbolTable symbolTable(*reader, *sit);
 
-    ELFIO::symbol_section_accessor symbols(reader, *it);
+    auto symbolIterator = std::find_if(symbolTable.begin(), symbolTable.end(), [](const auto &symbol) {
+        return symbol->name() == EVAL_STRING_SYMBOL;
+    });
 
-    ELFIO::Elf64_Addr value = 0;
-    ELFIO::Elf_Xword size = 0;
-    unsigned char bind = 0;
-    unsigned char type = 0;
-    ELFIO::Elf_Half section = 0;
-    unsigned char other = 0;
-
-    if (!symbols.get_symbol(EVAL_STRING_SYMBOL, value, size, bind, type, section, other)) {
-        LOG_ERROR("find eval string symbol failed");
+    if (symbolIterator == symbolTable.end()) {
+        LOG_ERROR("can't find 'PyRun_SimpleString' function");
         return -1;
     }
 
-    eval = (EvalStringPtr)(base + value);
+    uintptr_t base = dynamic ? memoryMapping->start - minVA : 0;
+    eval = (EvalString) (base + symbolIterator.operator*()->value());
 
-    if (!symbols.get_symbol(EVAL_FRAME_DEFAULT_SYMBOL, value, size, bind, type, section, other) &&
-        !symbols.get_symbol(EVAL_FRAME_SYMBOL, value, size, bind, type, section, other)) {
-        LOG_ERROR("find eval frame symbol failed");
+    symbolIterator = std::find_if(symbolTable.begin(), symbolTable.end(), [](const auto &symbol) {
+        return symbol->name() == EVAL_FRAME_DEFAULT_SYMBOL || symbol->name() == EVAL_FRAME_SYMBOL;
+    });
+
+    if (symbolIterator == symbolTable.end()) {
+        LOG_ERROR("can't find 'PyEval_EvalFrameEx' and '_PyEval_EvalFrameDefault' function");
         return -1;
     }
 
-    LOG_INFO("eval frame address: 0x%lx", base + value);
+    void *fn = (void *) (base + symbolIterator.operator*()->value());
 
-    if (hook((void *)(base + value), (void *)entry, (void **)&origin) < 0) {
-        LOG_ERROR("hook eval frame failed");
+    LOG_INFO("function address: %p", fn);
+
+    if (trap_hook(fn, (void *) fake, (void **) &origin) < 0) {
+        LOG_ERROR("hook function failed");
         return -1;
     }
 
