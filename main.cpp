@@ -15,9 +15,11 @@ constexpr auto PYTHON_IMAGE = {
         "uwsgi"
 };
 
-constexpr auto EVAL_STRING_SYMBOL = "PyRun_SimpleString";
-constexpr auto EVAL_FRAME_SYMBOL = "PyEval_EvalFrameEx";
-constexpr auto EVAL_FRAME_DEFAULT_SYMBOL = "_PyEval_EvalFrameDefault";
+constexpr auto PYTHON_SYMBOL = {
+        "PyRun_SimpleString",
+        "_PyEval_EvalFrameDefault",
+        "PyEval_EvalFrameEx"
+};
 
 static EvalFrame origin = nullptr;
 static EvalString eval = nullptr;
@@ -69,19 +71,15 @@ int main(int argc, char **argv) {
     if (!process)
         return -1;
 
-    auto it = std::find_if(PYTHON_IMAGE.begin(), PYTHON_IMAGE.end(), [&](const auto &image) {
-        return process->getImageBase(image);
-    });
+    std::optional<zero::os::procfs::MemoryMapping> memoryMapping;
 
-    if (it == PYTHON_IMAGE.end()) {
+    if (std::none_of(
+            PYTHON_IMAGE.begin(),
+            PYTHON_IMAGE.end(),
+            [&](const auto &image) {
+                return memoryMapping = process->getImageBase(image);
+            })) {
         LOG_ERROR("can't find python image");
-        return -1;
-    }
-
-    std::optional<zero::os::procfs::MemoryMapping> memoryMapping = process->getImageBase(*it);
-
-    if (!memoryMapping) {
-        LOG_ERROR("can't get python image");
         return -1;
     }
 
@@ -97,7 +95,7 @@ int main(int argc, char **argv) {
 
     std::vector<std::shared_ptr<elf::ISection>> sections = reader->sections();
 
-    auto sit = std::find_if(
+    auto it = std::find_if(
             sections.begin(),
             sections.end(),
             [](const auto &section) {
@@ -105,7 +103,7 @@ int main(int argc, char **argv) {
             }
     );
 
-    if (sit == sections.end()) {
+    if (it == sections.end()) {
         LOG_ERROR("can't find symbol section");
         return -1;
     }
@@ -132,30 +130,39 @@ int main(int argc, char **argv) {
             }
     )->operator*().virtualAddress() & ~(PAGE_SIZE - 1);
 
-    elf::SymbolTable symbolTable(*reader, *sit);
+    elf::SymbolTable symbolTable(*reader, *it);
+    std::vector<std::unique_ptr<elf::ISymbol>> symbols;
 
-    auto symbolIterator = std::find_if(symbolTable.begin(), symbolTable.end(), [](const auto &symbol) {
-        return symbol->name() == EVAL_STRING_SYMBOL;
-    });
+    std::transform(
+            PYTHON_SYMBOL.begin(),
+            PYTHON_SYMBOL.end(),
+            std::back_inserter(symbols),
+            [&](const auto &name) -> std::unique_ptr<elf::ISymbol> {
+                auto it = std::find_if(symbolTable.begin(), symbolTable.end(), [&](const auto &symbol) {
+                    return symbol->name() == name;
+                });
 
-    if (symbolIterator == symbolTable.end()) {
+                if (it == symbolTable.end())
+                    return nullptr;
+
+                return it.operator*();
+            }
+    );
+
+    if (!symbols[0]) {
         LOG_ERROR("can't find 'PyRun_SimpleString' function");
         return -1;
     }
 
     uintptr_t base = dynamic ? memoryMapping->start - minVA : 0;
-    eval = (EvalString) (base + symbolIterator.operator*()->value());
+    eval = (EvalString) (base + symbols[0]->value());
 
-    symbolIterator = std::find_if(symbolTable.begin(), symbolTable.end(), [](const auto &symbol) {
-        return symbol->name() == EVAL_FRAME_DEFAULT_SYMBOL || symbol->name() == EVAL_FRAME_SYMBOL;
-    });
-
-    if (symbolIterator == symbolTable.end()) {
+    if (!symbols[1] && !symbols[2]) {
         LOG_ERROR("can't find 'PyEval_EvalFrameEx' and '_PyEval_EvalFrameDefault' function");
         return -1;
     }
 
-    void *fn = (void *) (base + symbolIterator.operator*()->value());
+    void *fn = (void *) (base + (symbols[1] ? symbols[1]->value() : symbols[2]->value()));
 
     LOG_INFO("function address: %p", fn);
 
